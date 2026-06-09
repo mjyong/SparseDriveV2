@@ -43,28 +43,46 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score_fast"
 
+# =============================================================================
+# NAVSIM v2 (EPDMS) 快速评测脚本。整体流程：
+#   1. 加载 agent + 权重，用 CacheOnlyDataset(从 data_cache 读特征) 跑 trainer.predict，
+#      得到每个 token 的预测轨迹 merged_predictions = {token: Trajectory}
+#   2. 按 log 把 token 分发给多个 worker(worker_map)，每个 worker 调 run_pdm_score：
+#        读 metric_cache → PDMSimulator 仿真 + PDMScorer 闭环打分 → 每帧一个 score 行(DataFrame)
+#   3. infer_start_adjacent_mapping: 找同一 log 内时间相邻的帧对
+#      create_scene_aggregators: 据此算"两帧扩展舒适度"并回填
+#      compute_final_scores: 用乘性指标×加权指标算最终 EPDMS 分
+#   4. 求均值、存 csv。脚本会跑两遍：bug 版(pdm_score) 与 修正版(pdm_score_fix_bug)，
+#      分别输出 navtest_v2.csv 和 navtest_v2_bug_fix.csv
+# =============================================================================
+
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]], pdm_score_fn) -> List[pd.DataFrame]:
     """
-    Helper function to run PDMS evaluation in.
-    :param args: input arguments
+    单个 worker 内运行的 PDMS 评测函数（被 worker_map 并行调用）。
+    :param args: 该 worker 分到的数据点列表，每个含 cfg / log_file / tokens / model_trajectory
+    :param pdm_score_fn: 实际打分函数（pdm_score 或 pdm_score_fix_bug）
+    :return: 每个被评测 token 一行的 DataFrame 列表
     """
     node_id = int(os.environ.get("NODE_RANK", 0))
     thread_id = str(uuid.uuid4())
     logger.info(f"Starting worker in thread_id={thread_id}, node_id={node_id}")
 
+    # 汇总本 worker 负责的 log 与 token；只保留模型确实给出了预测轨迹的 token
     log_names = [a["log_file"] for a in args]
     tokens = [t for a in args for t in a["tokens"]]
     cfg: DictConfig = args[0]["cfg"]
     model_trajectory = args[0]['model_trajectory']
     tokens = [t for t in tokens if t in model_trajectory]
 
+    # 实例化仿真器与打分器（二者的 proposal_sampling 必须一致）
     simulator: PDMSimulator = instantiate(cfg.simulator)
     scorer: PDMScorer = instantiate(cfg.scorer)
     assert (
         simulator.proposal_sampling == scorer.proposal_sampling
     ), "Simulator and scorer proposal sampling has to be identical"
 
+    # v2 引入背景车策略：non_reactive(日志回放) 或 reactive(对自车反应)
     if cfg.traffic_agents == "non_reactive":
         traffic_agents_policy: AbstractTrafficAgentsPolicy = instantiate(
             cfg.traffic_agents_policy.non_reactive, simulator.proposal_sampling
@@ -73,6 +91,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]], pdm_score
         traffic_agents_policy: AbstractTrafficAgentsPolicy = instantiate(
             cfg.traffic_agents_policy.reactive, simulator.proposal_sampling
         )
+    # 加载 metric_cache(预计算的仿真上下文) 与场景；只评测两者交集且模型有预测的 token
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
     scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
     scene_filter.log_names = log_names
@@ -85,6 +104,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]], pdm_score
 
     tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
     pdm_results: List[pd.DataFrame] = []
+    # 逐 token：取 metric_cache + 预测轨迹 → 闭环打分 → 组装一行结果（含 log_name/start_time 等元信息）
     for idx, (token) in enumerate(tokens_to_evaluate):
         logger.info(
             f"Processing scenario {idx + 1} / {len(tokens_to_evaluate)} in thread_id={thread_id}, node_id={node_id}"
@@ -115,9 +135,11 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]], pdm_score
             score_row["endpoint_y"] = absolute_endpoint.y
             score_row["start_point_x"] = metric_cache.ego_state.rear_axle.x
             score_row["start_point_y"] = metric_cache.ego_state.rear_axle.y
-            score_row["ego_simulated_states"] = [ego_simulated_states]  # used for two-frames extended comfort
+            # 保存自车仿真状态序列，供后面跨两帧计算 two_frame_extended_comfort 用
+            score_row["ego_simulated_states"] = [ego_simulated_states]
 
         except Exception:
+            # 单 token 失败不影响整体：记一行空结果并标 valid=False
             logger.warning(f"----------- Agent failed for token {token}:")
             traceback.print_exc()
             score_row = pd.DataFrame([PDMResults.get_empty_results()])
@@ -141,6 +163,9 @@ def infer_start_adjacent_mapping(score_df: pd.DataFrame, time_gap_threshold: flo
     """
     adjacent_mapping: Dict[str, str] = {}
 
+    # 注意：只在同一 log 内、且按 start_time 排序后时间差 ≤ 0.55s 的相邻帧之间建立映射。
+    # 稀疏子集(mini/navmini)里每个 log 往往只有单帧或帧不相邻 → 返回空 dict，
+    # 这会导致 create_scene_aggregators 里 all_updates 为空（已在该函数加保护）。
     for log_name, group_df in score_df[score_df["frame_type"] == SceneFrameType.ORIGINAL].groupby("log_name"):
         group_df = group_df.sort_values(by="start_time").reset_index(drop=True)
 
@@ -204,12 +229,23 @@ def create_scene_aggregators(
     full_score_df: pd.DataFrame,
     proposal_sampling: TrajectorySampling,
 ) -> pd.DataFrame:
+    """
+    根据相邻帧映射(all_mappings)计算"两帧扩展舒适度"(two_frame_extended_comfort)，
+    并把结果回填进 full_score_df。
 
+    :param all_mappings: {当前帧token: 前一帧token}，由 infer_start_adjacent_mapping 生成
+    :param full_score_df: 单帧 PDM 打分结果(含 ego_simulated_states 列，供跨帧聚合用)
+    :param proposal_sampling: 轨迹采样参数
+    :return: 增加了 two_frame_extended_comfort 列、去掉 ego_simulated_states 列的 DataFrame
+    """
+
+    # 先把该列全部置 NaN（NaN 表示"该帧没有可配对的前一帧"，compute_final_scores 会把它的权重归零）
     full_score_df["two_frame_extended_comfort"] = np.nan
     full_score_df = full_score_df.set_index("token")
 
     all_updates = []
 
+    # 对每一对(当前帧, 前一帧)做跨帧聚合，得到该帧的两帧扩展舒适度
     for now_frame, previous_frame in all_mappings.items():
         aggregator = SceneAggregator(
             now_frame=now_frame,
@@ -221,8 +257,13 @@ def create_scene_aggregators(
 
         all_updates.append(updated_rows)
 
-    all_updates_df = pd.concat(all_updates, ignore_index=True).set_index("token")
-    full_score_df.update(all_updates_df)
+    # ★ 保护：稀疏子集(如 mini/navmini)上可能没有任何时间相邻的帧对，
+    #   此时 all_updates 为空，pd.concat([]) 会抛 "No objects to concatenate"。
+    #   空时直接跳过回填——two_frame_extended_comfort 保持 NaN（其权重在后续被归零），不影响其余指标。
+    if all_updates:
+        all_updates_df = pd.concat(all_updates, ignore_index=True).set_index("token")
+        full_score_df.update(all_updates_df)
+
     full_score_df.reset_index(inplace=True)
     full_score_df = full_score_df.drop(columns=["ego_simulated_states"])
 
@@ -273,12 +314,14 @@ def main(cfg: DictConfig) -> None:
     callbacks = original_callbacks
     trainer = pl.Trainer(**cfg.trainer.params, callbacks=callbacks)
 
+    # 第一阶段：前向推理。每个 batch 经 predict_step 输出 {token: Trajectory}
     logger.info("Starting Validation")
     predictions = trainer.predict(
         model=lightning_module,
         dataloaders=test_dataloader,
     )
 
+    # 多卡时把各 rank 的预测 all_gather 后合并；单卡直接用
     dist.barrier()
     all_predictions = [None for _ in range(dist.get_world_size())]
 
@@ -290,6 +333,7 @@ def main(cfg: DictConfig) -> None:
     if dist.get_rank() != 0:
         return None
 
+    # 合并成全局 {token: Trajectory}
     merged_predictions = {}
     for proc_prediction in all_predictions:
         for d in proc_prediction:
@@ -326,11 +370,13 @@ def main(cfg: DictConfig) -> None:
         for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
     ]
     
-    ################################## bug_version
+    ################################## bug_version（用原始 pdm_score，复现官方 bug 前的口径）
+    # 第二阶段：多进程闭环打分 → 合并所有 token 的分行
     score_rows: List[pd.DataFrame] = worker_map(worker, partial(run_pdm_score, pdm_score_fn=pdm_score), data_points)
- 
+
     pdm_score_df = pd.concat(score_rows)
 
+    # 第三阶段：两帧扩展舒适度聚合 + 计算最终 EPDMS 分
     start_adjacent_mapping = infer_start_adjacent_mapping(pdm_score_df)
     pdm_score_df = create_scene_aggregators(
         start_adjacent_mapping, pdm_score_df, instantiate(cfg.simulator.proposal_sampling)
@@ -362,6 +408,7 @@ def main(cfg: DictConfig) -> None:
     pdm_score_df = pdm_score_df[["token", "valid"] + score_cols]
     pdm_score_df.loc[len(pdm_score_df)] = average_row
 
+    # 末行追加均值，存为 navtest_v2.csv（bug 版口径）
     save_path = Path(cfg.output_dir)
     timestamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
     pdm_score_df.to_csv(save_path / "navtest_v2.csv")
@@ -391,7 +438,8 @@ def main(cfg: DictConfig) -> None:
             """
         )
 
-    ################################## bug_fix version
+    ################################## bug_fix version（与上面完全同流程，仅把打分函数换成 pdm_score_fix_bug，
+    #   对应官方 issue #151 修复后的口径；结果存 navtest_v2_bug_fix.csv。两份口径都会报告。）
     score_rows: List[pd.DataFrame] = worker_map(worker, partial(run_pdm_score, pdm_score_fn=pdm_score_fix_bug), data_points)
 
     pdm_score_df = pd.concat(score_rows)
