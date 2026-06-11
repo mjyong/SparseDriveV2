@@ -1,0 +1,55 @@
+%YAML:1.0
+# SparseDriveV2 C++ 推理标定示例。K 为原始分辨率内参; R/t 为 sensor2lidar 外参。
+cam_l0_image: "data/cam_l0.jpg"
+cam_l0_K: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [1545.0, 0.0, 960.0,   0.0, 1545.0, 560.0,   0.0, 0.0, 1.0]
+cam_l0_R: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [0.57, -0.011, 0.82,  -0.82, -0.015, 0.57,  0.006, -0.99, -0.018]
+cam_l0_t: !!opencv-matrix
+  rows: 3
+  cols: 1
+  dt: d
+  data: [1.6, 0.4, 1.5]
+
+cam_f0_image: "data/cam_f0.jpg"
+cam_f0_K: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [1545.0, 0.0, 960.0,   0.0, 1545.0, 560.0,   0.0, 0.0, 1.0]
+cam_f0_R: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [0.0, -0.01, 1.0,  -1.0, -0.01, 0.0,  0.01, -1.0, -0.01]
+cam_f0_t: !!opencv-matrix
+  rows: 3
+  cols: 1
+  dt: d
+  data: [1.7, 0.0, 1.5]
+
+cam_r0_image: "data/cam_r0.jpg"
+cam_r0_K: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [1545.0, 0.0, 960.0,   0.0, 1545.0, 560.0,   0.0, 0.0, 1.0]
+cam_r0_R: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [-0.57, -0.011, 0.82,  -0.82, 0.015, -0.57,  -0.006, -0.99, -0.018]
+cam_r0_t: !!opencv-matrix
+  rows: 3
+  cols: 1
+  dt: d
+  data: [1.6, -0.4, 1.5]
+
+# driving_command(4 one-hot) + velocity(vx,vy) + acceleration(ax,ay)
+status: [0.0, 1.0, 0.0, 0.0,   8.5, 0.0,   0.2, 0.0]

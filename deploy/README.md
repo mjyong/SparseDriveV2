@@ -48,6 +48,36 @@ python deploy/verify_trt.py --engine deploy/sparsedrive_v2_fp32.engine \
 最后一条是硬标准：SparseDriveV2 的输出是"从离散词表 argmax 选一条"，
 只要 argmax 不漂移，输出轨迹与 PyTorch **逐点完全一致**（它们是同一份常量词表里的同一行）。
 
+## C++ 部署 (NVIDIA Thor / TRT >= 8.5)
+
+`deploy/cpp/`：完整 C++ 推理（图像+标定+can_bus → 轨迹），只用 TRT name-based
+API（`setTensorAddress`/`enqueueV3`，TRT 10 上 bindings API 已删除，故兼容 Thor）。
+
+```bash
+# 构建（Thor 上 TensorRT/CUDA 在系统路径；自定义安装加 -DTENSORRT_ROOT=...）
+cd deploy/cpp && mkdir -p build && cd build
+cmake .. && make -j
+
+# 第一步：raw 对齐验证（绕过 C++ 预处理，必须与 python 输出一致）
+python - <<'PY'
+import numpy as np, os
+d = np.load('deploy/sparsedrive_v2_fp32_io.npz'); os.makedirs('deploy/raw', exist_ok=True)
+for k in ["imgs", "projection_mat", "image_wh", "status_feature"]:
+    d[k].astype('float32').tofile(f'deploy/raw/{k}.bin')
+print("trajectory_ref:\n", d["trajectory_ref"][0])
+PY
+./sparsedrive_infer ../../sparsedrive_v2_fp32.engine --raw ../../raw
+#   ↑ 输出应与上面 trajectory_ref 逐点一致（同一引擎、同一输入）
+
+# 第二步：完整管线（按 calib_example.yaml 填你的图像路径与标定）
+./sparsedrive_infer ../../sparsedrive_v2_fp32.engine --calib ../calib_example.yaml
+```
+
+C++ 预处理与 Python 的差异点（仅一处）：`cv::resize(INTER_CUBIC)` vs
+`PIL.Image.resize`（插值实现细节不同，亚像素级差异）。raw 模式可逐位对齐；
+完整管线模式如出现 argmax 漂移，用同一张图分别 dump 两边的 `imgs` 张量比对。
+自采数据若有镜头畸变，喂入前先去畸变并替换为矫正后内参（模型为纯针孔投影）。
+
 ## 已知限制
 
 - batch 固定为 1（静态 shape，部署常态；需动态 batch 自行加 dynamic_axes）。
