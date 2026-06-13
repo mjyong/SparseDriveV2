@@ -78,6 +78,23 @@ C++ 预处理与 Python 的差异点（仅一处）：`cv::resize(INTER_CUBIC)` 
 完整管线模式如出现 argmax 漂移，用同一张图分别 dump 两边的 `imgs` 张量比对。
 自采数据若有镜头畸变，喂入前先去畸变并替换为矫正后内参（模型为纯针孔投影）。
 
+## PyTorch 推理 + 可视化 + 加载 OpenScene 自采数据
+
+```bash
+# A) 单帧推理 + 可视化（3 相机, 前视叠投影轨迹, BEV 轨迹+自车）
+python deploy/infer.py --ckpt ckpt/sparsedrive_navsimv2_90p3.ckpt --version v2 \
+    --cache-token exp/data_cache_mini/<log>/<token> --viz vis.png [--ground-z 0.0] [--cpu-daf]
+
+# B) 直接加载“已转成 OpenScene 格式+pkl”的自采数据，批量推理+出图
+python deploy/run_openscene.py --ckpt ckpt/sparsedrive_navsimv2_90p3.ckpt --version v2 \
+    --data-root /path/to/your_dataset --split my_split --out-dir exp/openscene_vis \
+    [--limit 20] [--no-route] [--ground-z 0.0] [--cpu-daf]
+```
+B 通过 navsim `SceneLoader` 直接读 `navsim_logs/<split>/*.pkl` + `sensor_blobs/<split>`，
+每个 token 取 `AgentInput` 的当前帧相机/ego，喂入 `SparseDriveInference`，输出 `<token>.png`。
+数据无 route 信息时加 `--no-route`（关闭 has_route 过滤）。
+前视投影轨迹若浮在路面上方，调 `--ground-z` 为负值（约 -LiDAR 高度）。
+
 ## 已知限制
 
 - batch 固定为 1（静态 shape，部署常态；需动态 batch 自行加 dynamic_axes）。

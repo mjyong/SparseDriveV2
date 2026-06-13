@@ -162,6 +162,118 @@ def trajectory_to_global(traj: np.ndarray, ego_xy, ego_heading) -> np.ndarray:
     return np.concatenate([xy, head[:, None]], axis=1)
 
 
+# ---------- 工具：从 navsim AgentInput 提取 infer() 所需输入 ----------
+def cameras_from_agent_input(agent_input, cam_names) -> dict:
+    """agent_input.cameras[-1] (当前帧) 的指定相机 -> infer() 的 cameras dict。"""
+    frame = agent_input.cameras[-1]
+    cams = {}
+    for name in cam_names:
+        cam = getattr(frame, name)
+        cams[name] = {
+            "image": cam.image,  # 已加载的 RGB np 数组（SceneLoader 用 PIL 读入）
+            "intrinsics": cam.intrinsics,
+            "sensor2lidar_rotation": cam.sensor2lidar_rotation,
+            "sensor2lidar_translation": cam.sensor2lidar_translation,
+            "distortion": cam.distortion,
+        }
+    return cams
+
+
+def ego_from_agent_input(agent_input) -> dict:
+    s = agent_input.ego_statuses[-1]
+    return {
+        "driving_command": np.asarray(s.driving_command, np.float32),
+        "velocity": np.asarray(s.ego_velocity, np.float32),
+        "acceleration": np.asarray(s.ego_acceleration, np.float32),
+    }
+
+
+# ---------- 轨迹投影到原始图像（纯针孔，与 get_camera_params 同款 lidar2img）----------
+def _lidar2img(K, R, t):
+    R = np.asarray(R, np.float64)
+    t = np.asarray(t, np.float64)
+    K = np.asarray(K, np.float64)
+    lidar2cam_r = np.linalg.inv(R)
+    lidar2cam_t = t @ lidar2cam_r.T
+    rt = np.eye(4)
+    rt[:3, :3] = lidar2cam_r.T
+    rt[3, :3] = -lidar2cam_t
+    viewpad = np.eye(4)
+    viewpad[: K.shape[0], : K.shape[1]] = K
+    return viewpad @ rt.T
+
+
+def _project_points(pts_xyz, K, R, t, image_wh):
+    """pts_xyz: (M,3) 自车/LiDAR 系 -> 像素 uv + 有效掩码。"""
+    l2i = _lidar2img(K, R, t)
+    pts = np.concatenate([pts_xyz, np.ones((len(pts_xyz), 1))], axis=1)
+    img = pts @ l2i.T
+    depth = img[:, 2]
+    uv = img[:, :2] / np.clip(depth[:, None], 1e-6, None)
+    W, H = image_wh
+    valid = (depth > 0.1) & (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+    return uv, valid
+
+
+# ---------- 可视化：3 路相机(前视叠轨迹) + BEV(轨迹+自车) ----------
+def visualize(cameras: dict, trajectory: np.ndarray, save_path: str = None,
+              ground_z: float = 0.0, cam_order=("cam_l0", "cam_f0", "cam_r0")):
+    """
+    左->右: 左相机 | 前相机(投影轨迹) | 右相机 | BEV(轨迹+自车框)。
+    :param ground_z: 轨迹在自车/LiDAR 系的贴地高度；前视投影若浮空，调成负值(约 -LiDAR 高度)。
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    fig = plt.figure(figsize=(22, 5))
+    gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 0.9])
+    titles = {"cam_l0": "Left (cam_l0)", "cam_f0": "Front (cam_f0)", "cam_r0": "Right (cam_r0)"}
+    traj = np.asarray(trajectory)
+
+    for i, name in enumerate(cam_order):
+        ax = fig.add_subplot(gs[0, i])
+        c = cameras[name]
+        img = c.get("image")
+        if img is None:
+            img = np.array(Image.open(str(c["image_path"])))
+        img = np.asarray(img)
+        ax.imshow(img)
+        ax.set_title(titles.get(name, name))
+        ax.axis("off")
+        if name == "cam_f0":  # 中间前视图叠加投影轨迹（含自车原点）
+            H, W = img.shape[:2]
+            poses = np.concatenate([np.zeros((1, 2)), traj[:, :2]], axis=0)
+            pts = np.concatenate([poses, np.full((len(poses), 1), ground_z)], axis=1)
+            uv, valid = _project_points(pts, c["intrinsics"], c["sensor2lidar_rotation"],
+                                        c["sensor2lidar_translation"], (W, H))
+            if valid.sum() >= 2:
+                ax.plot(uv[valid, 0], uv[valid, 1], "-o", color="lime", linewidth=3, markersize=5)
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+    # BEV：x 前为上、y 左为左
+    axb = fig.add_subplot(gs[0, 3])
+    xy = np.concatenate([np.zeros((1, 2)), traj[:, :2]], axis=0)
+    axb.plot(xy[:, 1], xy[:, 0], "-o", color="tab:blue", linewidth=2, markersize=4, label="pred trajectory")
+    axb.add_patch(Rectangle((-0.925, -1.0), 1.85, 4.08, fill=False, edgecolor="red", linewidth=2))  # 自车框(近似)
+    axb.plot(0, 0, "rs", markersize=6, label="ego")
+    axb.set_aspect("equal")
+    axb.set_title("BEV")
+    axb.set_xlabel("y left (m)")
+    axb.set_ylabel("x forward (m)")
+    axb.invert_xaxis()  # 让 +y(左) 显示在左侧
+    axb.grid(True, alpha=0.3)
+    axb.legend(loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+    return fig
+
+
 # ---------- 可验证 demo：从 data_cache 的一个 token 读“原始”输入，跑标准化推理 ----------
 def _inputs_from_cache(token_dir: str, cfg):
     """从 data_cache 的 sparsedrive_feature.gz 还原 cameras/ego 原始输入，用于自检。"""
@@ -189,6 +301,8 @@ def main():
     ap.add_argument("--version", choices=["v1", "v2"], default="v2")
     ap.add_argument("--cache-token", default=None, help="data_cache 中某 token 目录，跑可验证 demo")
     ap.add_argument("--cpu-daf", action="store_true", help="用 grid_sample 等价算子(可 CPU)")
+    ap.add_argument("--viz", default=None, help="保存可视化图片路径(如 vis.png)")
+    ap.add_argument("--ground-z", type=float, default=0.0, help="前视投影贴地高度，浮空时调负值")
     args = ap.parse_args()
 
     infer = SparseDriveInference(args.ckpt, version=args.version, use_torch_daf=args.cpu_daf)
@@ -204,6 +318,10 @@ def main():
     np.set_printoptions(precision=3, suppress=True)
     print("trajectory (x, y, heading) ego-frame:\n", traj)
     print("shape:", traj.shape)
+
+    if args.viz:
+        visualize(cameras, traj, save_path=args.viz, ground_z=args.ground_z)
+        print(f"[viz] saved -> {args.viz}")
 
 
 if __name__ == "__main__":
