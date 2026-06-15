@@ -53,6 +53,12 @@ def main():
     ap.add_argument("--require-route", action="store_true",
                     help="只保留有 route(roadblock_ids) 的场景；默认不过滤(自采数据通常无 route，"
                          "且 route 不进 SparseDriveV2 网络，仅评测/打分才需要)")
+    # ---- 场景/token 选择 ----
+    ap.add_argument("--log-names", nargs="+", default=None,
+                    help="只加载这些 pkl(不带 .pkl 后缀)，如 --log-names log_a log_b")
+    ap.add_argument("--tokens", nargs="+", default=None, help="只加载这些场景 token")
+    ap.add_argument("--tokens-file", default=None, help="从文本文件读 token(每行一个)")
+    ap.add_argument("--max-scenes", type=int, default=None, help="最多加载几个场景")
     args = ap.parse_args()
 
     data_root = Path(args.data_root)
@@ -64,10 +70,19 @@ def main():
 
     # 2) 构建 SceneLoader 直接读 OpenScene pkl
     #    sensor_config 用 agent 的配置(加载 SparseDrive 需要的相机帧)，保证 .image 被读入
+    # token 选择：命令行 --tokens 或 --tokens-file(每行一个)
+    sel_tokens = args.tokens
+    if args.tokens_file:
+        with open(args.tokens_file) as f:
+            sel_tokens = [t.strip() for t in f if t.strip()]
+
     scene_filter = SceneFilter(
         num_history_frames=4,
         num_future_frames=10,
         has_route=args.require_route,  # 默认 False：不按 route 过滤（自采数据通常无 roadblock_ids）
+        log_names=args.log_names,      # None=全部 pkl；否则只加载这些(不带 .pkl)
+        tokens=sel_tokens,             # None=全部 token；否则只加载这些
+        max_scenes=args.max_scenes,    # None=不限
     )
     scene_loader = SceneLoader(
         data_path=data_root / "navsim_logs" / args.split,
@@ -75,6 +90,11 @@ def main():
         scene_filter=scene_filter,
         sensor_config=infer.agent.get_sensor_config(),
     )
+    if len(scene_loader.tokens) == 0:
+        raise SystemExit(
+            "加载到 0 个场景。可能原因：log-names/tokens 写错、数据字段缺失、"
+            "或 has_route 过滤(自采数据加默认即可，不要传 --require-route)。"
+        )
     tokens = scene_loader.tokens
     if args.limit:
         tokens = tokens[: args.limit]
