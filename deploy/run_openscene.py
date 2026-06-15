@@ -97,6 +97,13 @@ def main():
     ap.add_argument("--require-route", action="store_true",
                     help="只保留有 route(roadblock_ids) 的场景；默认不过滤(自采数据通常无 route，"
                          "且 route 不进 SparseDriveV2 网络，仅评测/打分才需要)")
+    # ---- 场景切窗（决定一条 log 切出多少 token）----
+    ap.add_argument("--num-history-frames", type=int, default=4,
+                    help="窗口历史帧数；推理只用当前帧，设 1 可让每帧都成 token")
+    ap.add_argument("--num-future-frames", type=int, default=10,
+                    help="窗口未来帧数；推理不需要未来帧，设 0 可让末尾帧也成 token")
+    ap.add_argument("--frame-interval", type=int, default=None,
+                    help="切窗步长；默认=窗口长度(不重叠)。设 1 = 每帧一个 token(重叠)")
     # ---- 场景/token 选择 ----
     ap.add_argument("--log-names", nargs="+", default=None,
                     help="只加载这些 pkl(不带 .pkl 后缀)，如 --log-names log_a log_b")
@@ -121,8 +128,9 @@ def main():
             sel_tokens = [t.strip() for t in f if t.strip()]
 
     scene_filter = SceneFilter(
-        num_history_frames=4,
-        num_future_frames=10,
+        num_history_frames=args.num_history_frames,  # 设 1 + future=0 可逐帧出 token
+        num_future_frames=args.num_future_frames,
+        frame_interval=args.frame_interval,          # None=不重叠；1=每帧一个 token
         has_route=args.require_route,  # 默认 False：不按 route 过滤（自采数据通常无 roadblock_ids）
         log_names=args.log_names,      # None=全部 pkl；否则只加载这些(不带 .pkl)
         tokens=sel_tokens,             # None=全部 token；否则只加载这些
