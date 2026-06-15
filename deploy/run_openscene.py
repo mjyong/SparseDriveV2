@@ -32,12 +32,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader
 
-from deploy.infer import (
-    SparseDriveInference,
-    cameras_from_agent_input,
-    ego_from_agent_input,
-    visualize,
-)
+from deploy.infer import SparseDriveInference, visualize
+
+
+def load_inputs_direct(scene_loader, token, cam_names, num_history_frames, sensor_blobs_path):
+    """
+    直接从已解析的原始 frame 字典读取 3 路相机 + ego，绕过 Cameras.from_camera_dict
+    的“必须含 8 路相机”硬编码假设（自采数据常只有 SparseDrive 用的 3 路）。
+    字段名与 navsim AgentInput.from_scene_dict_list 完全一致。
+    """
+    frames = scene_loader.scene_frames_dicts[token]      # 原始 frame_list
+    cur = frames[num_history_frames - 1]                 # 当前帧
+    cam_dict = {k.lower(): v for k, v in cur["cams"].items()}  # 兼容大小写键名
+
+    cameras = {}
+    for name in cam_names:
+        if name not in cam_dict:
+            raise KeyError(f"pkl 缺相机 '{name}'，当前帧仅有: {list(cam_dict.keys())}")
+        c = cam_dict[name]
+        dist = c.get("distortion", np.zeros(5))
+        cameras[name] = {
+            "image_path": Path(sensor_blobs_path) / c["data_path"],
+            "intrinsics": np.asarray(c["cam_intrinsic"], np.float64),
+            "sensor2lidar_rotation": np.asarray(c["sensor2lidar_rotation"], np.float64),
+            "sensor2lidar_translation": np.asarray(c["sensor2lidar_translation"], np.float64),
+            "distortion": np.asarray(dist, np.float64),
+        }
+
+    eds = cur["ego_dynamic_state"]                       # [vx, vy, ax, ay]
+    ego = {
+        "driving_command": np.asarray(cur["driving_command"], np.float32),
+        "velocity": np.asarray(eds[:2], np.float32),
+        "acceleration": np.asarray(eds[2:], np.float32),
+    }
+    return cameras, ego
 
 
 def main():
@@ -88,7 +116,7 @@ def main():
         data_path=data_root / "navsim_logs" / args.split,
         original_sensor_path=data_root / "sensor_blobs" / args.split,
         scene_filter=scene_filter,
-        sensor_config=infer.agent.get_sensor_config(),
+        sensor_config=SensorConfig.build_no_sensors(),  # 不用 AgentInput，直接读原始 dict
     )
     if len(scene_loader.tokens) == 0:
         raise SystemExit(
@@ -100,12 +128,14 @@ def main():
         tokens = tokens[: args.limit]
     print(f"[info] {args.split}: 共 {len(scene_loader.tokens)} 个场景，本次处理 {len(tokens)} 个")
 
+    sensor_blobs_path = data_root / "sensor_blobs" / args.split
     np.set_printoptions(precision=3, suppress=True)
     for i, token in enumerate(tokens):
-        # 3) 取当前帧的相机 + ego 输入
-        agent_input = scene_loader.get_agent_input_from_token(token)
-        cameras = cameras_from_agent_input(agent_input, cam_names)
-        ego = ego_from_agent_input(agent_input)
+        # 3) 取当前帧的相机 + ego 输入（直接读原始 dict，不走 8 路硬编码的 AgentInput）
+        cameras, ego = load_inputs_direct(
+            scene_loader, token, cam_names,
+            scene_filter.num_history_frames, sensor_blobs_path,
+        )
 
         # 4) 推理
         traj = infer(cameras, ego)  # (8,3) 自车系
