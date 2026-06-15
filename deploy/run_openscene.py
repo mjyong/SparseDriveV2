@@ -14,9 +14,11 @@ pkl 里每帧 scene_dict 必须含 SparseDriveV2 用到的字段：
     python deploy/run_openscene.py \
         --ckpt ckpt/sparsedrive_navsimv2_90p3.ckpt --version v2 \
         --data-root /path/to/your_dataset --split my_split \
-        --out-dir exp/openscene_vis [--limit 20] [--ground-z 0.0] [--cpu-daf]
+        --out-dir exp/openscene_vis [--limit 20] [--ground-z 0.0] [--cpu-daf] [--require-route]
 
 输出: 每个 token 一张 <token>.png（3 相机+前视投影轨迹+BEV），并打印轨迹。
+注: route(roadblock_ids) 不进 SparseDriveV2 网络，默认不按 route 过滤场景；
+    仅当你要复现官方"只评测有 route 的场景"时才加 --require-route。
 """
 import argparse
 import os
@@ -48,7 +50,9 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="只跑前 N 个场景")
     ap.add_argument("--ground-z", type=float, default=0.0)
     ap.add_argument("--cpu-daf", action="store_true")
-    ap.add_argument("--no-route", action="store_true", help="数据无 route 信息时关闭 has_route 过滤")
+    ap.add_argument("--require-route", action="store_true",
+                    help="只保留有 route(roadblock_ids) 的场景；默认不过滤(自采数据通常无 route，"
+                         "且 route 不进 SparseDriveV2 网络，仅评测/打分才需要)")
     args = ap.parse_args()
 
     data_root = Path(args.data_root)
@@ -63,7 +67,7 @@ def main():
     scene_filter = SceneFilter(
         num_history_frames=4,
         num_future_frames=10,
-        has_route=not args.no_route,
+        has_route=args.require_route,  # 默认 False：不按 route 过滤（自采数据通常无 roadblock_ids）
     )
     scene_loader = SceneLoader(
         data_path=data_root / "navsim_logs" / args.split,

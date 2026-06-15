@@ -88,11 +88,11 @@ python deploy/infer.py --ckpt ckpt/sparsedrive_navsimv2_90p3.ckpt --version v2 \
 # B) 直接加载“已转成 OpenScene 格式+pkl”的自采数据，批量推理+出图
 python deploy/run_openscene.py --ckpt ckpt/sparsedrive_navsimv2_90p3.ckpt --version v2 \
     --data-root /path/to/your_dataset --split my_split --out-dir exp/openscene_vis \
-    [--limit 20] [--no-route] [--ground-z 0.0] [--cpu-daf]
+    [--limit 20] [--ground-z 0.0] [--cpu-daf] [--require-route]
 ```
 B 通过 navsim `SceneLoader` 直接读 `navsim_logs/<split>/*.pkl` + `sensor_blobs/<split>`，
 每个 token 取 `AgentInput` 的当前帧相机/ego，喂入 `SparseDriveInference`，输出 `<token>.png`。
-数据无 route 信息时加 `--no-route`（关闭 has_route 过滤）。
+默认不按 route(roadblock_ids) 过滤（route 不进网络，仅评测/打分需要）；要只跑有 route 的场景才加 `--require-route`。
 前视投影轨迹若浮在路面上方，调 `--ground-z` 为负值（约 -LiDAR 高度）。
 
 ## 已知限制
