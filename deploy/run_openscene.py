@@ -32,15 +32,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader
 
-from deploy.infer import SparseDriveInference, visualize
+from deploy.infer import SparseDriveInference, rectify_image, visualize
 
 
-def load_inputs_direct(scene_loader, token, cam_names, num_history_frames, sensor_blobs_path):
+def load_inputs_direct(scene_loader, token, cam_names, num_history_frames, sensor_blobs_path,
+                       undistort: bool = False, undistort_alpha: float = 0.0):
     """
     直接从已解析的原始 frame 字典读取 3 路相机 + ego，绕过 Cameras.from_camera_dict
     的“必须含 8 路相机”硬编码假设（自采数据常只有 SparseDrive 用的 3 路）。
     字段名与 navsim AgentInput.from_scene_dict_list 完全一致。
+    :param undistort: True 时把图像去畸变成针孔图并替换为矫正后内参（强畸变相机必用）
     """
+    from PIL import Image
     frames = scene_loader.scene_frames_dicts[token]      # 原始 frame_list
     cur = frames[num_history_frames - 1]                 # 当前帧
     cam_dict = {k.lower(): v for k, v in cur["cams"].items()}  # 兼容大小写键名
@@ -50,14 +53,23 @@ def load_inputs_direct(scene_loader, token, cam_names, num_history_frames, senso
         if name not in cam_dict:
             raise KeyError(f"pkl 缺相机 '{name}'，当前帧仅有: {list(cam_dict.keys())}")
         c = cam_dict[name]
-        dist = c.get("distortion", np.zeros(5))
-        cameras[name] = {
-            "image_path": Path(sensor_blobs_path) / c["data_path"],
-            "intrinsics": np.asarray(c["cam_intrinsic"], np.float64),
+        K = np.asarray(c["cam_intrinsic"], np.float64)
+        D = np.asarray(c.get("distortion", np.zeros(5)), np.float64)
+        entry = {
+            "intrinsics": K,
             "sensor2lidar_rotation": np.asarray(c["sensor2lidar_rotation"], np.float64),
             "sensor2lidar_translation": np.asarray(c["sensor2lidar_translation"], np.float64),
-            "distortion": np.asarray(dist, np.float64),
+            "distortion": D,
         }
+        if undistort:
+            img = np.array(Image.open(str(Path(sensor_blobs_path) / c["data_path"])))  # RGB
+            img_rect, K_rect = rectify_image(img, K, D, alpha=undistort_alpha)
+            entry["image"] = img_rect          # 矫正后图像(数组)
+            entry["intrinsics"] = K_rect        # 矫正后内参
+            entry["distortion"] = np.zeros(5)   # 已矫正，后续按无畸变处理
+        else:
+            entry["image_path"] = Path(sensor_blobs_path) / c["data_path"]
+        cameras[name] = entry
 
     eds = cur["ego_dynamic_state"]                       # [vx, vy, ax, ay]
     ego = {
@@ -78,6 +90,10 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="只跑前 N 个场景")
     ap.add_argument("--ground-z", type=float, default=0.0)
     ap.add_argument("--cpu-daf", action="store_true")
+    ap.add_argument("--undistort", action="store_true",
+                    help="喂网络前去畸变(强畸变/广角相机必开；模型是纯针孔投影)")
+    ap.add_argument("--undistort-alpha", type=float, default=0.0,
+                    help="0=裁掉无效区无黑边(默认), 1=保留全部像素有黑边")
     ap.add_argument("--require-route", action="store_true",
                     help="只保留有 route(roadblock_ids) 的场景；默认不过滤(自采数据通常无 route，"
                          "且 route 不进 SparseDriveV2 网络，仅评测/打分才需要)")
@@ -135,6 +151,7 @@ def main():
         cameras, ego = load_inputs_direct(
             scene_loader, token, cam_names,
             scene_filter.num_history_frames, sensor_blobs_path,
+            undistort=args.undistort, undistort_alpha=args.undistort_alpha,
         )
 
         # 4) 推理

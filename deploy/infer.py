@@ -188,8 +188,26 @@ def ego_from_agent_input(agent_input) -> dict:
     }
 
 
-# ---------- 轨迹投影到原始图像（纯针孔，与 get_camera_params 同款 lidar2img）----------
-def _lidar2img(K, R, t):
+# ---------- 去畸变：把畸变图像矫正成针孔图 + 新内参（自采强畸变相机必用）----------
+def rectify_image(image, K, D, alpha: float = 0.0):
+    """
+    OpenCV 标准去畸变(支持 5/8/12 参; D 长度=8 自动用 RATIONAL_MODEL)。
+    :param alpha: 0=裁掉无效区(无黑边,损失少量 FOV); 1=保留全部像素(有黑边)
+    :return: (img_rect 矫正后图像, K_rect 矫正后内参 3x3)
+    外参 sensor2lidar 不变；把 img_rect + K_rect 喂给 infer 即与纯针孔投影一致。
+    """
+    import cv2
+    image = np.asarray(image)
+    K = np.asarray(K, np.float64).reshape(3, 3)
+    D = np.asarray(D, np.float64).ravel()
+    h, w = image.shape[:2]
+    K_rect, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha)
+    map1, map2 = cv2.initUndistortRectifyMap(K, D, None, K_rect, (w, h), cv2.CV_32FC1)
+    img_rect = cv2.remap(image, map1, map2, cv2.INTER_LINEAR)
+    return img_rect, K_rect
+
+
+
     R = np.asarray(R, np.float64)
     t = np.asarray(t, np.float64)
     K = np.asarray(K, np.float64)
