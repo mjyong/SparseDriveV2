@@ -35,3 +35,13 @@ target_link_libraries(sparsedrive_infer PRIVATE
   ${TENSORRT_LIB}
   CUDA::cudart
   ${OpenCV_LIBS})
+
+# ---------------------------------------------------------------------------
+# ROS2 集成节点 (ros2_sparsedrive_infer.cpp) 不在此独立 CMake 构建，
+# 而是放到你们的 ROS2 workspace(ament_cmake) 里编译，因为它依赖你们的消息包
+# (seres_camera_msgs / foxglove_msgs / geometry_msgs 等)。集成示例:
+#   add_library(sparsedrive_ros ros2_sparsedrive_infer.cpp preprocess.cpp trt_engine.cpp)
+#   ament_target_dependencies(sparsedrive_ros rclcpp foxglove_msgs geometry_msgs
+#                             seres_camera_msgs seres_map_location_msgs msg_interfaces)
+#   target_link_libraries(sparsedrive_ros ${TENSORRT_LIB} CUDA::cudart ${OpenCV_LIBS})
+
